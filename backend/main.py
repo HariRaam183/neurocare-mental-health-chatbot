@@ -21,6 +21,36 @@ from nlp.emotional_model import EmotionAnalyzer  # make sure filename matches
 from nlp.intent_detection import detect_intent
 from nlp.crisis_detection import is_crisis
 
+
+# -----------------------------------------------------------------------------
+# Helper to detect generic/robotic AI replies
+# -----------------------------------------------------------------------------
+
+def is_generic_reply(text: str) -> bool:
+    """Detect generic, unhelpful AI responses that don't address the user's actual issue."""
+    bad_phrases = [
+        "help me understand",
+        "tell me more about",
+        "what's really on your mind",
+        "i'm genuinely interested",
+        "i'm here to listen",
+        "i'd love to understand better",
+        "share a bit more",
+        "how it's affecting you",
+        "that sounds important",
+        "can you tell me more",
+        "what's going on",
+        "i'm here for you",
+        "would you like to talk about",
+        "i hear you",
+        "that must be",
+    ]
+    t = text.lower()
+    # If the response contains multiple generic phrases or is too short, reject it
+    matches = sum(1 for p in bad_phrases if p in t)
+    return matches >= 1 or len(t) < 80
+
+
 # -----------------------------------------------------------------------------
 # FastAPI app + CORS
 # -----------------------------------------------------------------------------
@@ -272,51 +302,115 @@ def generate_gemini_reply(
 
     if gemini_model is None:
         print("DEBUG: Gemini model None; using template fallback.")
-        return choose_response(intent, crisis_flag)
+        return get_smart_fallback(user_message, intent, emotion)
 
-    system_msg = (
-        "You are NeuroCare — a warm, deeply empathetic mental health companion. "
-        "Listen carefully, validate emotions, and offer gentle guidance. "
-        "You are NOT a doctor, but you ARE genuinely caring.\n\n"
-        "RESPONSE STRUCTURE:\n"
-        "1. ACKNOWLEDGE: First sentence directly references what they shared. Use their words.\n"
-        "2. VALIDATE: Show their feelings are understandable and okay.\n"
-        "3. REFRAME: Help them see a different angle—their strength, progress, or hope.\n"
-        "4. SUGGEST: Give 1-3 practical, specific coping strategies for THEIR situation.\n"
-        "5. ENGAGE: Ask one genuine follow-up question.\n"
-        "6. LENGTH: 4-7 natural sentences.\n"
-        "7. TONE: Like a caring, understanding friend. Warm, real, genuine.\n\n"
-        "Make every response personal. Never generic. Include name acknowledgment if they shared it. "
-        "Show you actually listened by reflecting details back."
-    )
+    # Much stricter prompt that forces specific, actionable responses
+    system_msg = f"""You are NeuroCare, a supportive mental health companion. Respond to the user naturally.
+
+CRITICAL RULES (MUST FOLLOW):
+1. NEVER say "tell me more", "I'd love to understand", "share more", "what's on your mind" or similar deflecting phrases
+2. ALWAYS give a SPECIFIC, ACTIONABLE response based on what they said
+3. Reference their EXACT words (e.g., "exhausted", "exams tomorrow")
+4. Give 2-3 concrete suggestions they can do RIGHT NOW
+5. End with ONE specific follow-up question about their situation
+6. Keep response 3-5 sentences, warm but direct
+
+The user's intent is: {intent}
+The user's emotion is: {emotion}
+
+BAD RESPONSE EXAMPLE (DO NOT DO THIS):
+"That sounds important to you. I'd love to understand better—can you share a bit more?"
+
+GOOD RESPONSE EXAMPLE:
+"Being exhausted before exams is really tough—your body and mind are already stretched thin. Here's what can help right now: try the 25-5 technique (25 min focused study, 5 min break), keep water nearby, and pick just ONE topic to review tonight. Which subject feels most overwhelming?"""
 
     # Build conversation text for Gemini (text prompt)
     history_text = ""
     if history:
-        for msg in history[-8:]:
+        for msg in history[-6:]:
             role = "User" if msg.get("sender") == "user" else "NeuroCare"
             history_text += f"{role}: {msg.get('text','')}\n"
 
     user_prompt = (
         f"{system_msg}\n\n"
-        f"Conversation so far:\n{history_text}\n\n"
-        f"Detected emotion: {emotion}\nDetected intent: {intent}\n"
-        f"User: \"{user_message}\"\n\n"
-        "Respond now as NeuroCare (obey the constraints above)."
+        f"Conversation history:\n{history_text}\n"
+        f"User says: \"{user_message}\"\n\n"
+        f"Give a helpful, specific response (NOT generic):"
     )
 
     try:
-        # some genai SDKs provide .generate or .generate_text; we use generate_content as before
         response = gemini_model.generate_content(user_prompt)
-        # read .text or fallback to str
         if hasattr(response, "text"):
             reply_text = response.text.strip()
         else:
             reply_text = str(response).strip()
+
+        # Reject generic/robotic replies
+        if is_generic_reply(reply_text):
+            print(f"⚠️ Rejected generic Gemini reply: {reply_text[:100]}...")
+            return get_smart_fallback(user_message, intent, emotion)
+
         return reply_text
     except Exception as e:
-        print("Gemini error, falling back to template:", repr(e))
-        return choose_response(intent, crisis_flag)
+        print("Gemini error, falling back to smart response:", repr(e))
+        return get_smart_fallback(user_message, intent, emotion)
+
+
+def get_smart_fallback(user_message: str, intent: str, emotion: str) -> str:
+    """Generate context-aware fallback responses based on intent and user message."""
+    msg_lower = user_message.lower()
+    
+    # Exam-related responses
+    if intent == "exams" or any(w in msg_lower for w in ["exam", "test", "study"]):
+        responses = [
+            f"Exams can feel overwhelming, especially when you're already tired. Here's a quick strategy: break your study into 25-minute focused blocks with 5-minute breaks. Pick just ONE topic to master tonight instead of everything. What subject is weighing on you the most?",
+            f"I hear you—exam pressure is real and exhausting. Try this: write down the 3 most important topics, tackle the easiest one first to build momentum, and get at least 6 hours of sleep (your brain consolidates memory while sleeping). Which exam is coming up first?",
+            f"Exam stress hits hard. Let's make it manageable: create a mini checklist of just 3 things to review tonight. Done is better than perfect. Also, a 10-minute walk can actually boost your memory retention. What's the exam on?"
+        ]
+        return random.choice(responses)
+    
+    # Tiredness/exhaustion responses
+    if intent == "tiredness" or any(w in msg_lower for w in ["tired", "exhausted", "sleepy", "no energy"]):
+        responses = [
+            f"Feeling exhausted is your body telling you it needs care. Right now: drink a glass of water, do 10 deep breaths, and if possible take a 20-minute power nap (set an alarm!). What's been draining your energy lately?",
+            f"Exhaustion makes everything harder. Here's what helps: splash cold water on your face, step outside for 2 minutes of fresh air, and eat something with protein. Are you getting enough sleep at night?",
+            f"When you're this tired, small wins matter. Try: stretch for 60 seconds, have a healthy snack, and tackle just ONE small task. Your energy will come back. What's been keeping you up?"
+        ]
+        return random.choice(responses)
+    
+    # Anxiety responses
+    if intent == "anxiety" or any(w in msg_lower for w in ["anxious", "worried", "nervous", "panic"]):
+        responses = [
+            f"Anxiety can feel overwhelming, but let's ground you. Try this now: name 5 things you can see, 4 you can touch, 3 you can hear. This brings you back to the present moment. What's triggering the anxiety right now?",
+            f"When anxiety hits, your body goes into overdrive. Here's a quick reset: breathe in for 4 counts, hold for 4, out for 6. Repeat 3 times. This activates your calm response. What specific worry is loudest right now?",
+            f"Anxiety is tough but manageable. Right now: unclench your jaw, drop your shoulders, and take 3 slow breaths. Write down what's worrying you—getting it out of your head helps. What feels most urgent?"
+        ]
+        return random.choice(responses)
+    
+    # Sadness responses  
+    if intent == "sadness" or any(w in msg_lower for w in ["sad", "depressed", "hopeless", "lonely"]):
+        responses = [
+            f"I'm really sorry you're feeling this way. Sadness is valid and it's okay to not be okay. One small step: reach out to one person today, even just a text. You don't have to go through this alone. What's been weighing on your heart?",
+            f"Feeling down is hard, and I want you to know your feelings matter. Try this: do one tiny thing that usually brings comfort—a warm drink, a favorite song, or just sitting in sunlight for 5 minutes. When did this feeling start?",
+            f"Sadness can feel isolating. Here's something gentle: write down 3 things that went okay today (even tiny things count). Your brain needs reminders of the good. Would you like to talk about what's making you sad?"
+        ]
+        return random.choice(responses)
+    
+    # Stress responses
+    if intent == "stress" or any(w in msg_lower for w in ["stressed", "pressure", "overwhelmed"]):
+        responses = [
+            f"Stress can pile up fast. Let's break it down: what's the ONE thing that would make the biggest difference if you handled it today? Focus there first. Everything else can wait. What's stressing you most?",
+            f"When everything feels urgent, nothing gets done. Try this: write down everything stressing you, then circle just the top 2. Tackle those and let the rest go for now. What's at the top of your list?",
+            f"Feeling overwhelmed means you care, and that's not a bad thing. But let's get practical: take 5 minutes to just breathe, then pick ONE small task to complete. Progress beats perfection. What's the first thing you can check off?"
+        ]
+        return random.choice(responses)
+    
+    # Greeting responses
+    if intent == "greeting":
+        return "Hey! I'm glad you're here. How are you really feeling today? Don't hold back—I'm here to help with whatever's on your mind."
+    
+    # Default fallback - still specific and helpful
+    return f"I want to give you real support, not generic advice. You mentioned '{user_message[:50]}{'...' if len(user_message) > 50 else ''}'. Can you tell me a bit more about what's happening so I can offer something actually useful? What's the main thing you're dealing with right now?"
 
 # -----------------------------------------------------------------------------
 # API routes
@@ -335,6 +429,14 @@ def chat_endpoint(payload: ChatRequest):
 
     # 2. Intent
     intent = detect_intent(user_message)
+
+    # Preserve last intent if current message is short or vague
+    if history_list:
+        last_bot_msg = next((m for m in reversed(history_list) if m.get("sender") == "bot"), None)
+        if last_bot_msg:
+            last_intent = last_bot_msg.get("intent")
+            if intent == "unknown" and last_intent:
+                intent = last_intent
 
     # 3. Crisis detection
     crisis_flag = is_crisis(user_message) or (intent == "crisis")

@@ -230,7 +230,7 @@ function App() {
                 }}
               >
                 <div>{msg.text}</div>
-                {msg.sender === "bot" && (msg.emotion || msg.intent || msg.mode) && (
+                {msg.sender === "bot" && msg.text.length > 40 && (msg.emotion || msg.intent || msg.mode) && (
                   <div
                     style={{
                       marginTop: "6px",
